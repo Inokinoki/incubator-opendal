@@ -42,8 +42,9 @@ impl PathFilesystem for Ofs {
     // Callback when fs is being destroyed
     async fn destroy(&self, _req: Request) {}
 
-    async fn lookup(&self, _req: Request, _parent: &OsStr, _name: &OsStr) -> Result<ReplyEntry> {
+    async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<ReplyEntry> {
         // TODO
+        log::debug!("lookup(parent={:?}, name={:?})", parent, name);
         Err(libc::ENOSYS.into())
     }
 
