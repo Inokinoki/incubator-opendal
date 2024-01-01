@@ -16,13 +16,16 @@
 // under the License.
 
 use fuse3::path::prelude::*;
-use fuse3::Result;
+use fuse3::{Errno, Result};
 
 use async_trait::async_trait;
+use futures::executor::block_on;
 use futures_util::stream::{Empty, Iter};
+use futures_util::{stream, StreamExt};
 use std::ffi::OsStr;
 use std::vec::IntoIter;
 
+use opendal::EntryMode;
 use opendal::Operator;
 
 pub struct Ofs {
@@ -31,8 +34,8 @@ pub struct Ofs {
 
 #[async_trait]
 impl PathFilesystem for Ofs {
-    type DirEntryStream = Empty<Result<DirectoryEntry>>;
-    type DirEntryPlusStream = Iter<IntoIter<Result<DirectoryEntryPlus>>>;
+    type DirEntryStream = Iter<IntoIter<Result<DirectoryEntry>>>;
+    type DirEntryPlusStream = Empty<Result<DirectoryEntryPlus>>;
 
     // Init a fuse filesystem
     async fn init(&self, _req: Request) -> Result<()> {
@@ -107,10 +110,91 @@ impl PathFilesystem for Ofs {
         fh: u64,
         offset: i64,
     ) -> Result<ReplyDirectory<Self::DirEntryStream>> {
-        // TODO
         log::debug!("readdir(path={:?}, fh={}, offset={})", path, fh, offset);
 
-        Err(libc::ENOSYS.into())
+        let parent_path = path.to_string_lossy();
+
+        // Check whether the parent is a dir
+        match block_on(self.op.stat(&parent_path)) {
+            Ok(parent_metadata) => {
+                if parent_metadata.mode() != EntryMode::DIR {
+                    // The parent is not a dir
+                    return Err(Errno::new_is_not_dir());
+                };
+            }
+            Err(_) => {
+                return Err(Errno::new_not_exist());
+            }
+        };
+
+        let entries = match block_on(self.op.list(&parent_path)) {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::warn!("readdir failed due to {:?}", error);
+                return Err(Errno::new_not_exist());
+            }
+        };
+        let mut directory_entries = Vec::new();
+        if offset < 2 {
+            match offset {
+                0 => {
+                    directory_entries.push(DirectoryEntry {
+                        kind: FileType::Directory,
+                        name: OsStr::new(".").into(),
+                        offset: 0,
+                    });
+                    directory_entries.push(DirectoryEntry {
+                        kind: FileType::Directory,
+                        name: OsStr::new("..").into(),
+                        offset: 1,
+                    });
+                }
+                1 => {
+                    directory_entries.push(DirectoryEntry {
+                        kind: FileType::Directory,
+                        name: OsStr::new("..").into(),
+                        offset: 1,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let mut inner_offset = 2;
+        for (_, entry) in entries.into_iter().enumerate().skip((offset - 2) as usize) {
+            let metadata = block_on(self.op.stat(entry.path())).unwrap();
+
+            match metadata.mode() {
+                EntryMode::FILE => {
+                    log::debug!("Handling file");
+                    directory_entries.push(DirectoryEntry {
+                        kind: FileType::RegularFile,
+                        name: entry.name().into(),
+                        offset: inner_offset,
+                    });
+
+                    inner_offset = inner_offset + 1;
+                }
+                EntryMode::DIR => {
+                    log::debug!("Handling dir {} {}", entry.path(), entry.name());
+
+                    directory_entries.push(DirectoryEntry {
+                        kind: FileType::Directory,
+                        name: entry.name().into(),
+                        offset: inner_offset,
+                    });
+
+                    inner_offset = inner_offset + 1;
+                }
+                EntryMode::Unknown => continue,
+            };
+        }
+
+        Ok(ReplyDirectory {
+            entries: stream::iter(block_on(
+                stream::iter(directory_entries).map(Ok).collect::<Vec<_>>(),
+            )),
+        })
     }
 
     async fn mknod(
